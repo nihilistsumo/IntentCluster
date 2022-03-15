@@ -55,10 +55,10 @@ def main():
                        'C:\\Users\\suman\\Documents\\niket_intent_work\\data\\test.jsonl',
                        'infer_out\\best_loss_clustering_model.model.jsonl')
     '''
-    get_best_documents_simplified('saved_models\\best_loss_clustering_model.model',
-                                  'C:\\Users\\suman\\Documents\\niket_intent_work\\data_simple\\corpus.txt',
-                                  'C:\\Users\\suman\\Documents\\niket_intent_work\\data_simple\\queries.txt',
-                                  'infer_out\\answer.txt')
+    get_best_documents_simplified('saved_models\\best_loss_soft_clustering_model.model',
+                                  'C:\\Users\\suman\\Documents\\niket_intent_work\\query_label_data\\corpus.txt',
+                                  'C:\\Users\\suman\\Documents\\niket_intent_work\\query_label_data\\queries.txt',
+                                  'infer_out\\query_label_answer.txt')
 
 
 if __name__ == '__main__':

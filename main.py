@@ -8,7 +8,7 @@ from sentence_transformers import models, SentenceTransformer
 from sklearn.cluster import KMeans, kmeans_plusplus
 from sklearn.metrics import adjusted_rand_score
 import numpy as np
-from handle_data import get_intent_data
+from handle_data import get_intent_data, get_query_label_data
 from clustering import ClusteringModel
 import random
 random.seed(42)
@@ -21,6 +21,7 @@ def put_features_in_device(input_features, device):
 
 
 def eval_model(clustering_model, eval_texts, true_labels=None):
+    clustering_model.eval()
     eval_emb = clustering_model.qp_model.encode(eval_texts, convert_to_tensor=True)
     pred_labels = clustering_model.get_clustering(eval_emb, 3)
     rand_score = -1
@@ -29,8 +30,19 @@ def eval_model(clustering_model, eval_texts, true_labels=None):
     return rand_score, eval_emb, pred_labels
 
 
-def train_model(train_file, val_file, emb_model_name, emb_dim, device, model_out, batch_size=64, max_num_tokens=256, weight_decay=0.01,
-                num_epochs=3, lrate=1e-5, warmup=1000, max_grad_norm=1.0):
+def eval_soft_clustering_model(clustering_model, eval_texts, eval_label_emb):
+    clustering_model.eval()
+    mse = nn.MSELoss()
+    eval_label_emb_tensor = torch.tensor(eval_label_emb)
+    gt_mat = 1 / (1 + torch.cdist(eval_label_emb_tensor, eval_label_emb_tensor, p=2))
+    eval_text_emb = clustering_model.qp_model.encode(eval_texts, convert_to_tensor=True)
+    eval_text_sim_mat = 1 / (1 + torch.cdist(eval_text_emb, eval_text_emb))
+    #return torch.sum((gt_mat - eval_text_sim_mat.cpu()) ** 2)
+    return mse(gt_mat, eval_text_sim_mat.cpu())
+
+
+def train_model(train_file, val_file, emb_model_name, emb_dim, device, model_out, batch_size=64, max_num_tokens=256,
+                weight_decay=0.01, num_epochs=3, lrate=1e-5, warmup=1000, max_grad_norm=1.0):
     train_data = get_intent_data(train_file)
     val_data = get_intent_data(val_file)
     val_texts = [dat.split('_')[0] for dat in val_data]
@@ -51,6 +63,7 @@ def train_model(train_file, val_file, emb_model_name, emb_dim, device, model_out
     best_loss = 9999.0
     for epoch in range(num_epochs):
         for b in range(num_batches):
+            model.train()
             batch_data = train_data[b * batch_size: (b+1) * batch_size]
             batch_texts = [dat.split('_')[0] for dat in batch_data]
             batch_labels = [dat.split('_')[1] for dat in batch_data]
@@ -82,6 +95,53 @@ def train_model(train_file, val_file, emb_model_name, emb_dim, device, model_out
             schd.step()
 
 
+def train_model_soft_clustering(train_file, val_file, emb_model_name, emb_dim, device, model_out, batch_size=64,
+                                max_num_tokens=256, weight_decay=0.01, num_epochs=3, lrate=1e-5, warmup=1000,
+                                max_grad_norm=1.0):
+    train_queries, train_labels, train_label_emb = get_query_label_data(train_file, emb_model_name)
+    val_queries, val_labels, val_label_emb = get_query_label_data(val_file, emb_model_name)
+    num_batches = len(train_queries) // batch_size
+    num_train_steps = num_epochs * num_batches
+    model = ClusteringModel(emb_model_name, emb_dim, device, max_num_tokens)
+    model_params = list(model.named_parameters())
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model_params if not any(nd in n for nd in no_decay)],
+         'weight_decay': weight_decay},
+        {'params': [p for n, p in model_params if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    opt = AdamW(optimizer_grouped_parameters, lr=lrate)
+    schd = transformers.get_linear_schedule_with_warmup(opt, warmup, num_train_steps)
+    mse = nn.MSELoss()
+    best_loss = 9999.0
+    for epoch in range(num_epochs):
+        for b in range(num_batches):
+            model.train()
+            batch_queries = train_queries[b * batch_size: (b+1) * batch_size]
+            batch_labels = train_labels[b * batch_size: (b+1) * batch_size]
+            batch_label_emb = torch.tensor(train_label_emb[b * batch_size: (b+1) * batch_size], device=device, requires_grad=True)
+            if len(set(batch_labels)) < 3:
+                continue
+            gt = 1 / (1 + torch.cdist(batch_label_emb, batch_label_emb))
+            batch_features = model.qp_model.tokenize(batch_queries)
+            put_features_in_device(batch_features, device)
+            batch_emb = model.qp_model(batch_features)['sentence_embedding']
+            sim_mat = 1 / (1 + torch.cdist(batch_emb, batch_emb))
+            #loss = torch.sum((gt - sim_mat) ** 2)
+            loss = mse(gt, sim_mat)
+            loss.backward()
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                torch.save(model, model_out)
+                print('\nSaved model with loss %.4f\n' % best_loss)
+            eval_loss = eval_soft_clustering_model(model, val_queries, val_label_emb)
+            print('\rLoss: %.4f, val loss: %.4f' % (loss.item(), eval_loss), end='')
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            opt.step()
+            opt.zero_grad()
+            schd.step()
+
+
 def main():
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -89,12 +149,20 @@ def main():
     else:
         device = torch.device('cpu')
         print('CUDA not available, using device: '+str(device))
+    '''
     train_model('C:\\Users\\suman\\Documents\\niket_intent_work\\data\\train.jsonl',
                 'C:\\Users\\suman\\Documents\\niket_intent_work\\data\\val.jsonl',
                 'sentence-transformers/all-MiniLM-L6-v2',
                 256,
                 device,
                 'saved_models/best_loss_clustering_model.model')
+    '''
+    train_model_soft_clustering('C:\\Users\\suman\\Documents\\niket_intent_work\\query_label_data\\train.json',
+                                'C:\\Users\\suman\\Documents\\niket_intent_work\\query_label_data\\dev.json',
+                                'sentence-transformers/all-MiniLM-L6-v2',
+                                256,
+                                device,
+                                'saved_models/best_loss_soft_clustering_model.model')
 
 
 if __name__ == '__main__':
